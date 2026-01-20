@@ -52,10 +52,13 @@
         <section class="space-y-3">
             <div class="flex justify-between items-center px-1">
                 <h2 class="font-bold text-slate-700">Today's Log</h2>
-                <span id="user-badge" class="text-[9px] bg-slate-200/50 px-2 py-1 rounded-full text-slate-500 font-mono">Syncing...</span>
+                <span id="user-badge" class="text-[9px] bg-slate-200/50 px-2 py-1 rounded-full text-slate-500 font-mono italic">Initializing...</span>
             </div>
             <div id="meal-list" class="space-y-3">
-                <div class="text-center py-12 text-slate-400 italic">Loading your meals...</div>
+                <div id="initial-loading" class="text-center py-12 text-slate-400 flex flex-col items-center gap-3">
+                    <i data-lucide="loader-2" class="w-8 h-8 animate-spin text-emerald-500"></i>
+                    <p class="text-sm">Connecting to your records...</p>
+                </div>
             </div>
         </section>
     </main>
@@ -69,7 +72,7 @@
             </button>
             <label class="flex items-center justify-center bg-emerald-500 hover:bg-emerald-600 text-white w-12 h-12 rounded-full cursor-pointer transition-all active:scale-90">
                 <i data-lucide="camera" class="w-6 h-6"></i>
-                <input type="file" accept="image/*" class="hidden" onchange="handleImageAnalysis(this)">
+                <input type="file" id="file-input" accept="image/*" class="hidden" onchange="handleImageAnalysis(this)">
             </label>
         </div>
     </div>
@@ -112,6 +115,7 @@
                 <div id="loading-view" class="hidden py-10 text-center space-y-4">
                     <div class="flex justify-center"><i data-lucide="refresh-cw" class="w-12 h-12 text-emerald-500 spinner"></i></div>
                     <p class="font-bold text-slate-800 tracking-tight">AI Analysis in progress...</p>
+                    <p class="text-sm text-slate-500 px-4">Our AI is scanning your meal to estimate nutritional value.</p>
                 </div>
             </div>
         </div>
@@ -121,7 +125,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, addDoc, onSnapshot, query, doc, deleteDoc, Timestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const firebaseConfig = JSON.parse(__firebase_config);
@@ -133,23 +137,34 @@
         let currentUser = null;
         let dailyGoalKcal = parseInt(localStorage.getItem('nutrisnap_goal_kcal')) || 2000;
 
-        // UI Initialization
         lucide.createIcons();
         document.getElementById('goal-kcal-display').innerText = dailyGoalKcal;
         document.getElementById('input-goal-kcal').value = dailyGoalKcal;
 
-        // 1. Authentication
+        async function startAuth() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth error:", err);
+                showToast("Connection failed. Retrying...");
+                setTimeout(startAuth, 3000);
+            }
+        }
+
         onAuthStateChanged(auth, (user) => {
             if (user) {
                 currentUser = user;
-                document.getElementById('user-badge').innerText = `DEVICE: ${user.uid.slice(0, 8)}`;
+                document.getElementById('user-badge').innerText = `ID: ${user.uid.slice(0, 8)}`;
                 syncMeals();
             } else {
-                signInAnonymously(auth);
+                startAuth();
             }
         });
 
-        // 2. Data Sync
         function syncMeals() {
             if (!currentUser) return;
             const path = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'meals');
@@ -157,7 +172,10 @@
                 const meals = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
                 meals.sort((a,b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0));
                 renderMeals(meals);
-            }, (err) => showToast("Sync Error"));
+            }, (err) => {
+                console.error("Firestore Error:", err);
+                showToast("Data sync error.");
+            });
         }
 
         function renderMeals(meals) {
@@ -169,9 +187,10 @@
             let totalKcal = 0;
             let totalProt = 0;
             
-            list.innerHTML = meals.length === 0 ? 
-                `<div class="text-center py-12 text-slate-400">No logs for today.</div>` :
-                meals.map(m => {
+            if (meals.length === 0) {
+                list.innerHTML = `<div class="text-center py-12 text-slate-400">No logs for today.</div>`;
+            } else {
+                list.innerHTML = meals.map(m => {
                     totalKcal += Number(m.calories || 0);
                     totalProt += Number(m.protein || 0);
                     return `
@@ -187,11 +206,11 @@
                         </div>
                     `;
                 }).join('');
+            }
             
             kcalEl.innerText = totalKcal;
             protEl.innerText = totalProt;
 
-            // Handle limit alert (Red when >= 90% of goal)
             if (totalKcal >= (dailyGoalKcal * 0.9)) {
                 kcalEl.classList.add('limit-reached');
                 summaryCard.classList.add('border-red-200', 'bg-red-50');
@@ -199,24 +218,9 @@
                 kcalEl.classList.remove('limit-reached');
                 summaryCard.classList.remove('border-red-200', 'bg-red-50');
             }
-
             lucide.createIcons();
         }
 
-        // 3. Goals Logic
-        window.saveGoal = () => {
-            const newGoal = parseInt(document.getElementById('input-goal-kcal').value);
-            if (newGoal > 0) {
-                dailyGoalKcal = newGoal;
-                localStorage.setItem('nutrisnap_goal_kcal', newGoal);
-                document.getElementById('goal-kcal-display').innerText = newGoal;
-                closeGoalModal();
-                syncMeals(); // Refresh UI to update red alerts
-                showToast("Daily goal updated!");
-            }
-        };
-
-        // 4. AI Analysis
         window.handleImageAnalysis = async (input) => {
             const file = input.files[0];
             if (!file) return;
@@ -245,6 +249,8 @@
                         await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
                     }
 
+                    if (!response || !response.ok) throw new Error("API Limit reached");
+
                     const result = await response.json();
                     const text = result.candidates[0].content.parts[0].text.replace(/```json|```/g, "").trim();
                     const data = JSON.parse(text);
@@ -269,21 +275,47 @@
                     protein: Number(prot),
                     timestamp: Timestamp.now()
                 });
-            } catch (e) { showToast("Error saving log."); }
+            } catch (e) { showToast("Save failed."); }
         };
 
         window.deleteEntry = async (id) => {
+            if (!currentUser) return;
             const path = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'meals', id);
             await deleteDoc(path);
         };
 
-        // Modal Controls
+        window.saveGoal = () => {
+            const val = parseInt(document.getElementById('input-goal-kcal').value);
+            if (val > 0) {
+                dailyGoalKcal = val;
+                localStorage.setItem('nutrisnap_goal_kcal', val);
+                document.getElementById('goal-kcal-display').innerText = val;
+                closeGoalModal();
+                syncMeals();
+            }
+        };
+
         window.openModal = () => {
             document.getElementById('modal-overlay').classList.remove('hidden');
             document.getElementById('modal-overlay').classList.add('flex');
+            document.getElementById('form-view').classList.remove('hidden');
+            document.getElementById('loading-view').classList.add('hidden');
         };
-        window.closeModal = () => document.getElementById('modal-overlay').classList.add('hidden');
-        
+
+        window.closeModal = () => {
+            document.getElementById('modal-overlay').classList.add('hidden');
+            document.getElementById('modal-overlay').classList.remove('flex');
+            // Reset input values
+            document.getElementById('meal-name').value = '';
+            document.getElementById('meal-kcal').value = '';
+            document.getElementById('meal-prot').value = '';
+            // Reset file input so same file can be uploaded again if needed
+            document.getElementById('file-input').value = '';
+            // Ensure views are reset for next time
+            document.getElementById('form-view').classList.remove('hidden');
+            document.getElementById('loading-view').classList.add('hidden');
+        };
+
         window.openGoalModal = () => {
             document.getElementById('goal-modal').classList.remove('hidden');
             document.getElementById('goal-modal').classList.add('flex');
@@ -294,7 +326,7 @@
             const n = document.getElementById('meal-name').value;
             const k = document.getElementById('meal-kcal').value;
             const p = document.getElementById('meal-prot').value;
-            if (!n) return showToast("Name required");
+            if (!n) return showToast("Meal name required");
             window.saveMeal(n, k || 0, p || 0);
             closeModal();
         };
